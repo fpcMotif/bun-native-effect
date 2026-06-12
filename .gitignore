@@ -1,0 +1,8 @@
+# ZIO is a reading reference only — never committed
+zio-reference/
+
+# Build outputs
+bun/build/
+**/target/
+node_modules/
+*.log
