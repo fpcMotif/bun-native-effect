@@ -1,0 +1,39 @@
+From fd7b6437a3bca81b0322fc4a419318658f79f539 Mon Sep 17 00:00:00 2001
+From: bbdfhtg <fpcmotif@gmail.com>
+Date: Fri, 12 Jun 2026 17:47:02 +0800
+Subject: [PATCH] test(transpiler): red golden test for F#-pipe |> behind
+ experimentalPipelineOperator
+
+Tracer bullet for the pipeline-operator slice: a |> b must lower to b(a)
+(spec: workspace ADR-0002/0003). Red under stock Bun (option silently
+ignored; lexer fails with 'Unexpected >'); goes green with the parser
+implementation in docs/slices/0001-pipeline-operator.md.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ test/bundler/transpiler/pipeline-operator.test.ts | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+ create mode 100644 test/bundler/transpiler/pipeline-operator.test.ts
+
+diff --git a/test/bundler/transpiler/pipeline-operator.test.ts b/test/bundler/transpiler/pipeline-operator.test.ts
+new file mode 100644
+index 0000000000..4a0c309230
+--- /dev/null
++++ b/test/bundler/transpiler/pipeline-operator.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it } from "bun:test";
++
++// F#-style pipeline operator: `a |> b` lowers to `b(a)`.
++// Flag-gated (default OFF) behind the Bun.Transpiler option `experimentalPipelineOperator`.
++describe("pipeline operator |>", () => {
++  it("transpiles a |> b to b(a) when experimentalPipelineOperator is enabled", () => {
++    const transpiler = new Bun.Transpiler({
++      loader: "js",
++      experimentalPipelineOperator: true,
++    } as any);
++    expect(transpiler.transformSync("a |> b")).toBe("b(a);\n");
++  });
++});
+-- 
+2.51.0.windows.1
+

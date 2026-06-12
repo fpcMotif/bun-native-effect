@@ -15,8 +15,8 @@ wherever they conflict.
 - `src/` is a Cargo workspace (~200 crates) built as `libbun_rust.a` via `cargo build -p bun_bin`,
   driven by `bun bd`. Per `bun/src/CLAUDE.md`: the `.zig` siblings are **non-compiled porting
   references**; new code goes in Rust.
-- Parser crate `bun_js_parser` (`bun/src/js_parser/`): `lexer.rs` (~159 KB), `p.rs` (~426 KB — the
-  port of the old 21k-line `js_parser.zig`), `parser.rs`, `fold.rs`, and `parse/*.rs`
+- Parser crate `bun_js_parser` (`bun/src/js_parser/`): `lexer.rs` (~159 KB), `p.rs` (~426 KB,
+  9,709 lines — the Rust parser core), `parser.rs`, `fold.rs`, and `parse/*.rs`
   (`parse_fn.rs`, `parse_suffix.rs`, `parse_prefix.rs`, …). Generator detection already exists:
   `parse/parse_fn.rs:26` (`is_generator = p.lexer.token == T::TAsterisk`); arrow machinery at
   `parse_arrow_body` (`parse_fn.rs:518`). Binary-op precedence levels: `js_ast::Op::Level`
@@ -35,14 +35,19 @@ flagged as wrong — they were right for this checkout.
 ### 0.2 effect-v4 @ `4500fbfe0`: there is no `Micro` module in v4
 - `packages/effect/src/Micro.ts` does not exist. The v4 core **is** the consolidated small
   runtime: `internal/effect.ts` (6,427 lines) + `internal/core.ts` (666 lines).
-- `FiberImpl` (effect.ts:497): `_stack: Array<Primitive>`, `currentOpCount`,
+- `FiberImpl` (effect.ts:496): `_stack: Array<Primitive>`, `currentOpCount`,
   `maxOpsBeforeYield` read from the `Scheduler.MaxOpsBeforeYield` reference, `evaluate()` /
   `runLoop()` (effect.ts:585/612), interruption via `_interruptedCause` + `interruptChildren`.
 - Dispatch is **not** a v3-style `contOpSuccess` table: each primitive carries a symbol-keyed
   `[evaluate](fiber)` method (`makePrimitive`). The compass doc's caveat "don't assume v3 names"
   was correct.
-- **The complete v4 opcode set (13 ops):** `Sync, Suspend, Yield, Async, AsyncFinalizer, Exit,
-  OnSuccess, OnFailure, OnSuccessAndFailure, OnExit, SetInterruptible, While, Iterator`.
+- **The complete v4 primitive set (17, adversarially verified):** 13 `makePrimitive` tags in
+  `effect.ts` — `Sync, Suspend, Yield, Async, AsyncFinalizer, exitPrimitive ("Exit", a
+  continuation wrapper — NOT the terminal exits), OnSuccess, OnFailure, OnSuccessAndFailure,
+  OnExit, SetInterruptible, While, Iterator` — **plus 4 more `[evaluate]`-dispatched primitives
+  in `core.ts`**: `Success` (:509) and `Failure` (:529, the terminal exit values), `WithFiber`
+  (:558, the pervasive reader primitive), and `YieldableError` (:571, errors that evaluate to
+  `exitFail(this)`).
 - The `setInterval` keepAlive cited from effect-smol issue #1404 is **gone** — fixed upstream.
 - v4 still clamps `Error.stackTraceLimit` (effect.ts:317–343, 1141–1142) — report (10)'s
   stack-suppression finding carries over and matters for the (optional) traces phase.
@@ -64,10 +69,12 @@ multithreading does not port (JSC is single-threaded). Gitignored; never committ
 
 ### Improvements not in any document
 
-1. **"MicroCore" replaces "Micro".** Since v4 has no Micro module, define the proving-ground as a
-   subset of the 13 v4 ops. Wave 1 (sync semantics): `Sync, Suspend, Exit, OnSuccess, OnFailure,
-   OnSuccessAndFailure, OnExit, Yield, While`. Wave 2 (the risk): `Async, AsyncFinalizer,
-   SetInterruptible`. Wave 3 (the hardest): `Iterator` (live single-shot generator).
+1. **"MicroCore" replaces "Micro".** Since v4 has no Micro module, define the proving-ground as
+   a subset of the 17 v4 primitives. Wave 1 (the 13 sync primitives): `Sync, Suspend,
+   exitPrimitive, Success, Failure, WithFiber, YieldableError, OnSuccess, OnFailure,
+   OnSuccessAndFailure, OnExit, Yield, While` — terminal exits and `WithFiber` included, or no
+   program can even finish. Wave 2 (the risk): `Async, AsyncFinalizer, SetInterruptible`.
+   Wave 3 (the hardest): `Iterator` (live single-shot generator).
 2. **Write the Rust model once, reuse it twice.** The standalone model crate abstracts JS values
    behind a `Value`/`Host` trait so the *same* crate is later compiled into Bun with `JSValue` +
    `Strong` rooting plugged in. No throwaway Rust.
@@ -97,28 +104,57 @@ multithreading does not port (JSC is single-threaded). Gitignored; never committ
 | 0.3 | Prove the test loop: `bun bd test <one transpiler test>` from `test/bundler/transpiler/` | test green |
 | 0.4 | Run effect-v4's own test suite with its normal toolchain (oracle health check) | suite green |
 
-**Milestone 0 gate:** edit→build→test cycle works on this machine. *Nothing else starts until
-this is green.* (See "first hard part" below.)
+**Milestone 0 gate:** edit→build→test cycle works on this machine — this gates *the tracer
+bullet going green*, not all work. (See "first hard part" below.)
+
+> **STATUS (2026-06-12): build machine = the Mac.** This Windows machine has no native
+> toolchain and stays toolchain-free by decision: it does Phase 1 (oracle + runtime map, stock
+> Bun only) and red-test/syntax authoring. Builds and green runs happen on the user's Mac —
+> see "Going green on the Mac" in `docs/slices/0001-pipeline-operator.md` (verified path:
+> Homebrew `cmake ninja pkg-config libtool ccache llvm@21 rustup-init`, no sudo, no bootstrap
+> script; WebKit is a prebuilt download into `~/.bun/build-cache`; ASAN is on by default in
+> macOS debug builds — keep it, we want ASAN for the native phases). The branch travels as
+> `patches/0001-*.patch` applied onto the pin. Windows-native install and WSL2 are off the
+> table.
+>
+> **⚠ NEVER run `bun/scripts/bootstrap.ps1` on a personal machine** (CI image-bake script:
+> unconditionally installs an OpenSSH server with a SYSTEM boot task granting every oven-sh
+> GitHub org member SSH access, copies binaries into System32, can destructively prune the
+> machine PATH — verified from source, bootstrap.ps1:315/104/512). The macOS `bootstrap.sh`
+> has no SSH server but defaults CARGO_HOME/RUSTUP_HOME to `/opt/rust` and pulls CI tooling —
+> skip it too; manual brew install is the whole job. Step 0.1 is done — the workspace repo
+> exists with `bun/` and `effect-v4/` as proper git submodules.
 
 ### Phase 1 — Semantics extraction (no Bun changes; can run parallel to Phase 2)
 
-- **1.1 v4 runtime map** (`docs/v4-runtime-map.md`): for each of the 13 primitives — constructor
+- **1.1 v4 runtime map** (`docs/v4-runtime-map.md`): for each of the 17 primitives — constructor
   site, fields, exact `[evaluate]` behavior, stack interaction, interrupt behavior, with
-  `effect.ts` line references. Plus: `FiberImpl` lifecycle, `maxOpsBeforeYield` yield protocol,
+  `effect.ts`/`core.ts` line references. Plus: `FiberImpl` lifecycle, `maxOpsBeforeYield` yield protocol,
   scheduler integration, `interruptChildren` semantics, how `Effect.gen` drives `Iterator`.
 - **1.2 Oracle harness** (`oracle/`, plain TS run on stock Bun): program-description JSON format,
   seeded random program generator, runner that executes descriptions on the effect-v4 runtime and
   emits `{ exit, events[] }`.
 
-**Gate:** 13/13 ops documented from source; oracle replays 1,000 seeded programs byte-identically
+**Gate:** 17/17 primitives documented from source; oracle replays 1,000 seeded programs byte-identically
 across runs (determinism is a property of the harness we'll depend on for everything later).
 
 ### Phase 2 — P1 syntax behind flags (first user-visible win, ~3–4 weeks)
 
-**Slice 2.1 = THE FIRST SLICE** (see §3). Minimal F#-pipe: lexer token `|>` in `lexer.rs`, one
-precedence level in `js_ast::Op::Level` (just above assignment, below ternary — match Babel
-fsharp), parse in the suffix/binary path, lower `a |> b` to `E.Call{ target: b, args: [a] }` at
-parse time, one golden test in `test/bundler/transpiler/`. Hard-gated behind a transpiler flag.
+**Slice 2.1 = THE FIRST SLICE** (see §3). Minimal F#-pipe: token `TBarGreaterThan`
+(`ast/lexer_tables.rs` punctuation block — enum order is load-bearing for `is_assign()` range
+checks) + one inner `0x3E` arm in the lexer's `|` match (`lexer.rs:1771`); insert `Level::Pipe`
+**between `Conditional` and `NullishCoalescing`** in `ast/op.rs:155` AND rewrite the
+hand-maintained `Level::from_raw` decoder (`op.rs:214`) in the same edit (it compiles-but-
+misdecodes otherwise); a new `sfx_` arm in `parse_suffix.rs` dispatch (~:1499) that guards
+`level.gte(Level::Pipe)`, parses the RHS at `Level::Pipe` (left-assoc), and lowers directly to
+`E::Call { target: rhs, args: [lhs] }` (no new `Op::Code`, no `TABLE` entry, no printer change —
+synthetic calls are the established JSX-lowering idiom); gate on
+`features.experimental_pipeline_operator` with `lexer.unexpected()` when off (ADR-0003). Babel
+semantics per ADR-0002: ternary binds looser (`a |> b ? c : d` ⇒ `(a |> b) ? c : d`), `??`/`||`
+bind tighter (`a |> b ?? c` ⇒ `a |> (b ?? c)`). One golden test in
+`test/bundler/transpiler/pipeline-operator.test.ts`. Checklist traps: `clone_for_lazy_export`
+(`parse_entry.rs:179`, compile-enforced) and the `[bool; 17]` cache-hash array
+(`parser.rs:387`, NOT compile-enforced — required when the CLI surface lands).
 
 **Slice 2.2** `*() =>`: extend the arrow path in `parse/parse_fn.rs` to accept a leading `*`,
 set `is_generator` on the arrow, lower to a generator function expression that captures lexical
@@ -137,7 +173,7 @@ Draft the upstreamable PR now — it banks a win even if everything after is kil
 
 Standalone crate `crates/effect-model` in this workspace (not in the bun tree yet):
 
-- `Primitive` enum mirroring the 13 ops; `Fiber { stack: Vec<ContFrame>, op_count, interrupt
+- `Primitive` enum mirroring the 17 primitives; `Fiber { stack: Vec<ContFrame>, op_count, interrupt
   state, refs }`; `run_loop` mirroring `FiberImpl.runLoop` including the `maxOpsBeforeYield`
   budget and interrupt polling at op boundaries; a `Scheduler` trait (deterministic test
   scheduler first).
